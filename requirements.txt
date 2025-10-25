@@ -1,3 +1,10 @@
+opencv-python
+pytesseract
+tesseract
+beautifulsoup4
+googlesearch-python
+fuzzywuzzy
+openpyxl
 streamlit
 pillow
 easyocr
