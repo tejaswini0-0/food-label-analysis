@@ -1,0 +1,16 @@
+{
+  "tejaswini": {
+    "display_name": "Tejaswini",
+    "pw_hash": "7b56e1a7a1fcdbaa00579bbaa686848201c8143efa09ae577db90645a804886a",
+    "salt": "3d23a92f373bf733e65ddd6fabdcb651",
+    "created": "2026-03-27T09:04:58.989255",
+    "profile": {
+      "weight_kg": 53.0,
+      "height_cm": 157.0,
+      "age": 21,
+      "sex": "Female",
+      "activity": "Moderately Active",
+      "goal": "Balanced"
+    }
+  }
+}

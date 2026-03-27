@@ -1,0 +1,64 @@
+[
+  {
+    "product": "Example Label 2",
+    "category": "\ud83e\udd63 Cereal / Granola",
+    "score": 66,
+    "grade": "C",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 4.0,
+      "calories": 240.0,
+      "total_fat": 4.0,
+      "saturated_fat": 1.5,
+      "sugar": 4.0,
+      "trans_fat": 9.0,
+      "sodium": 430.0,
+      "fiber": 79.0,
+      "added_sugar": 29.0
+    },
+    "saved_at": "2026-03-27T09:27:23.754434"
+  },
+  {
+    "product": "Example Label 2",
+    "category": "\ud83e\udd63 Cereal / Granola",
+    "score": 66,
+    "grade": "C",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 4.0,
+      "calories": 240.0,
+      "total_fat": 4.0,
+      "saturated_fat": 1.5,
+      "sugar": 4.0,
+      "trans_fat": 9.0,
+      "sodium": 430.0,
+      "fiber": 79.0,
+      "added_sugar": 29.0
+    },
+    "saved_at": "2026-03-27T09:26:13.478881"
+  },
+  {
+    "product": "Example Label 1",
+    "category": "\ud83c\udff7\ufe0f Other / Unknown",
+    "score": 88,
+    "grade": "A",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "calories": 230.0,
+      "total_fat": 8.0,
+      "saturated_fat": 1.0,
+      "sodium": 160.0,
+      "carbohydrates": 37.0,
+      "fiber": 4.0,
+      "sugar": 12.0,
+      "protein": 3.0,
+      "trans_fat": 0.0,
+      "cholesterol": 0.0,
+      "added_sugar": 1.0
+    },
+    "saved_at": "2026-03-27T09:16:02.694746"
+  }
+]
