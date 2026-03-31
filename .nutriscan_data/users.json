@@ -12,5 +12,19 @@
       "activity": "Moderately Active",
       "goal": "Balanced"
     }
+  },
+  "teejay": {
+    "display_name": "Tejaswini",
+    "pw_hash": "faf02f383f096843efaef6c5552a7be7d7f0daca879266d7965c525e38dd914f",
+    "salt": "7c913c61104d982c2962269940ad7495",
+    "created": "2026-03-30T14:43:38.314441",
+    "profile": {
+      "weight_kg": 57.0,
+      "height_cm": 155.0,
+      "age": 21,
+      "sex": "Female",
+      "activity": "Moderately Active",
+      "goal": "Balanced"
+    }
   }
 }

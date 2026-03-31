@@ -303,7 +303,8 @@ def render_auth_page() -> bool:
             if r_pw != r_pw2:
                 st.error("Passwords don't match.")
             else:
-                ok, msg = register_user(r_uname, r_pw, r_display)
+                from database import register_user_db
+                ok, msg = register_user_db(r_uname, r_pw, r_display)
                 if ok:
                     st.success(msg + "  You can now sign in.")
                 else:
@@ -411,7 +412,8 @@ def render_dashboard():
         """, unsafe_allow_html=True)
         return
 
-    scans = load_user_scans(user)
+    from database import load_scans_db
+    scans = load_scans_db(user)
 
     # ── Header ──
     st.markdown(f"""

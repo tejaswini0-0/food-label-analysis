@@ -14,20 +14,23 @@ Changes in v1.1:
 
 import streamlit as st
 from PIL import Image
-import easyocr
 import numpy as np
 import re
 import datetime
 from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 import plotly.graph_objects as go
-import cv2
 
 # Auth module (local file-based; swap internals for Supabase in Phase 2)
 from auth import (
     render_auth_page, render_auth_sidebar,
     persist_scan, render_dashboard,
 )
+from database import (
+    save_scan_db, load_scans_db, register_user_db,
+    update_profile_db, supabase_enabled,
+)
+from ocr_engine import _get_groq_key
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG  (must be first Streamlit call)
@@ -134,6 +137,70 @@ hr{{border-color:var(--border);margin:1.25rem 0;}}
   cursor:default;
 }}
 .history-pill .grade{{font-weight:700;font-size:.9rem;}}
+
+/* ── MOBILE RESPONSIVE ─────────────────────────────────────── */
+@media (max-width: 768px) {{
+  /* Stack all columns vertically */
+  [data-testid="column"] {{
+    width: 100% !important;
+    flex: 1 1 100% !important;
+    min-width: 100% !important;
+  }}
+  /* Smaller padding on cards */
+  .ns-card {{
+    padding: 1rem 1rem !important;
+  }}
+  /* Grade ring smaller on mobile */
+  .grade-ring {{
+    width: 52px !important;
+    height: 52px !important;
+    line-height: 52px !important;
+    font-size: 1.5rem !important;
+  }}
+  /* Tabs scrollable */
+  [data-testid="stTabs"] [role="tablist"] {{
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }}
+  /* File uploader full width */
+  [data-testid="stFileUploader"] {{
+    width: 100% !important;
+  }}
+  /* Topbar profile row wraps */
+  [data-testid="stHorizontalBlock"] {{
+    flex-wrap: wrap !important;
+  }}
+  /* Buttons full width */
+  div.stButton > button {{
+    padding: .65rem 1rem !important;
+    font-size: .88rem !important;
+  }}
+  /* Make number inputs smaller */
+  input[type="number"] {{
+    font-size: .85rem !important;
+  }}
+  /* Nutrient rows wrap */
+  .nut-row {{
+    font-size: .82rem !important;
+  }}
+}}
+@media (max-width: 480px) {{
+  .sec-hdr {{ font-size: 1rem !important; }}
+  .tag {{ font-size: .68rem !important; padding: .12rem .4rem !important; }}
+}}
+
+/* Touch-friendly tap targets */
+div.stButton > button {{
+  min-height: 44px;
+}}
+[data-testid="stFileUploader"] label {{
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}}
+/* Smooth scroll for mobile */
+html {{ scroll-behavior: smooth; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -183,678 +250,17 @@ MACRO_C = {"Protein": P["accent"], "Carbohydrates": "#6ab3f5", "Fat": P["bad"]}
 
 
 # ─────────────────────────────────────────────
-# OCR & PREPROCESSING
+# OCR ENGINE  (see ocr_engine.py)
 # ─────────────────────────────────────────────
-# ROOT CAUSE for coloured labels (like this FDA label):
-#   Rows like "Total Carbohydrate 37g" sit on a bright PINK background,
-#   "Dietary Fiber 4g" on PURPLE, "Total Sugars 12g" on GREEN, etc.
-#   Standard adaptive thresholding converts these coloured rows to dark
-#   blobs that erase the text entirely.
-#
-# SOLUTION — 6 strategies tried in parallel, best result wins:
-#   1. hsv_value    — extract V (brightness) from HSV; coloured backgrounds
-#                     are bright, dark text stays dark regardless of hue.
-#                     ★ BEST for FDA-style coloured nutrition labels
-#   2. lab_lum      — CLAHE on LAB L-channel + Otsu; good for tinted labels
-#   3. adaptive     — classic CLAHE + adaptive threshold; uneven lighting
-#   4. otsu         — Gaussian blur + Otsu; clean high-contrast labels
-#   5. invert       — inverted adaptive; white-on-dark backgrounds
-#   6. raw          — no preprocessing; always runs as final safety net
-#
-# GROQ VISION FALLBACK (if EasyOCR confidence is still low):
-#   Sends the image as base64 to Groq's free llama-4-scout-17b-16e-instruct
-#   vision model, asking it to return structured JSON of all nutrients.
-#   Requires GROQ_API_KEY in Streamlit secrets or environment variables.
-# ─────────────────────────────────────────────
-
-@st.cache_resource(show_spinner=False)
-def load_reader():
-    return easyocr.Reader(["en"], gpu=False)
-
-
-# ── Upscale helper ────────────────────────────────────────────────────────────
-def _upscale_rgb(arr: np.ndarray, min_dim: int = 1400) -> np.ndarray:
-    h, w = arr.shape[:2]
-    if max(h, w) < min_dim:
-        s   = min_dim / max(h, w)
-        arr = cv2.resize(arr, (int(w*s), int(h*s)), interpolation=cv2.INTER_LANCZOS4)
-    return arr
-
-
-# ── Strategy 1: HSV Value channel (★ best for coloured backgrounds) ───────────
-def _strategy_hsv_value(arr: np.ndarray) -> np.ndarray:
-    """
-    Converts to HSV and uses the Value channel only.
-    Coloured backgrounds (pink, purple, green, orange) all have HIGH Value
-    (they are bright). Dark text has LOW Value regardless of hue.
-    After CLAHE + Otsu, text is crisp black on white whatever the band colour.
-    """
-    hsv  = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    v    = hsv[:, :, 2]
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    v_eq  = clahe.apply(v)
-    v_eq  = cv2.fastNlMeansDenoising(v_eq, h=8)
-    _, binary = cv2.threshold(v_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-
-
-# ── Strategy 2: LAB luminance ─────────────────────────────────────────────────
-def _strategy_lab_lum(arr: np.ndarray) -> np.ndarray:
-    """
-    CLAHE on the L channel of LAB colour space, then Otsu.
-    Works well when backgrounds have moderate saturation / tinted paper.
-    """
-    lab  = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    l_eq  = clahe.apply(l)
-    lab2  = cv2.merge([l_eq, a, b])
-    gray  = cv2.cvtColor(cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB), cv2.COLOR_RGB2GRAY)
-    gray  = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    gray  = cv2.fastNlMeansDenoising(gray, h=8)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-
-
-# ── Strategy 3: Adaptive threshold ────────────────────────────────────────────
-def _strategy_adaptive(arr: np.ndarray) -> np.ndarray:
-    """CLAHE + denoise + adaptive threshold. Best for uneven lighting."""
-    gray  = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    eq    = clahe.apply(gray)
-    eq    = cv2.fastNlMeansDenoising(eq, h=12)
-    binary = cv2.adaptiveThreshold(eq, 255,
-                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 29, 9)
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-
-
-# ── Strategy 4: Otsu on grayscale ─────────────────────────────────────────────
-def _strategy_otsu(arr: np.ndarray) -> np.ndarray:
-    """Gaussian blur + Otsu. Best for clean, high-contrast labels."""
-    gray  = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    blur  = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-
-
-# ── Strategy 5: Invert + adaptive ─────────────────────────────────────────────
-def _strategy_invert(arr: np.ndarray) -> np.ndarray:
-    """Inverted adaptive. For white-on-dark / light-on-dark labels."""
-    gray  = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    inv   = cv2.bitwise_not(gray)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    eq    = clahe.apply(inv)
-    binary = cv2.adaptiveThreshold(eq, 255,
-                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 29, 9)
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-
-
-# ── OCR scorer ────────────────────────────────────────────────────────────────
-def _ocr_score(results: List[Tuple]) -> float:
-    """
-    Score = (total confident chars) × avg_confidence.
-    Bonus multiplier if key nutrition words are present — this biases
-    selection toward results that actually extracted the right content.
-    """
-    if not results:
-        return 0.
-    total_chars = sum(len(t) for _, t, _ in results)
-    avg_conf    = sum(c for _, _, c in results) / len(results)
-    base        = total_chars * avg_conf
-    # Keyword bonus: each of these found adds 15% to score
-    all_text = " ".join(t.lower() for _, t, _ in results)
-    keywords = ["sodium","carbohydrate","protein","calorie","fat","fiber","sugar"]
-    bonus    = sum(0.15 for kw in keywords if kw in all_text)
-    return base * (1 + bonus)
-
-
-# ── Main OCR runner ───────────────────────────────────────────────────────────
-# Keywords that indicate a good nutrition label parse
-_GOOD_KW = ["sodium","carbohydrate","protein","calorie","fat","fiber","sugar"]
-_GOOD_KW_THRESHOLD = 4   # if this many keywords found → accept immediately
-
-def run_ocr(pil_img: Image.Image) -> List[Tuple]:
-    """
-    Speed-optimised multi-strategy OCR.
-    Strategy: run hsv_value first (best for coloured labels).
-    If it finds ≥4 nutrition keywords, accept immediately (fast path).
-    Otherwise try up to 2 more strategies and pick the best.
-    Greedy decoder used throughout (3-5× faster than beamsearch).
-    """
-    reader  = load_reader()
-    arr     = _upscale_rgb(np.array(pil_img.convert("RGB")))
-
-    def _run(name, fn):
-        try:
-            processed = fn(arr)
-            results   = reader.readtext(processed, detail=1, paragraph=False)
-            return name, results, _ocr_score(results)
-        except Exception:
-            return name, [], 0.
-
-    best_results: List[Tuple] = []
-    best_score   = 0.
-    best_name    = "none"
-
-    def _update(name, results, sc):
-        nonlocal best_results, best_score, best_name
-        if sc > best_score:
-            best_score, best_results, best_name = sc, results, name
-
-    def _is_good_enough(results):
-        txt = " ".join(t.lower() for _, t, _ in results)
-        return sum(1 for kw in _GOOD_KW if kw in txt) >= _GOOD_KW_THRESHOLD
-
-    # ── Fast path: try HSV first ──────────────────────────────────────────────
-    name, results, sc = _run("hsv_value", _strategy_hsv_value)
-    _update(name, results, sc)
-    if _is_good_enough(results):
-        st.session_state["ocr_strategy"] = best_name
-        st.session_state["ocr_score"]    = round(best_score, 1)
-        return best_results
-
-    # ── Slow path: try 2 more strategies ─────────────────────────────────────
-    for name, fn in [("lab_lum", _strategy_lab_lum), ("otsu", _strategy_otsu)]:
-        n, r, sc = _run(name, fn)
-        _update(n, r, sc)
-        if _is_good_enough(r):
-            break
-
-    # ── Final fallback: raw image ─────────────────────────────────────────────
-    if not best_results:
-        n, r, sc = _run("raw", lambda a: a)
-        _update(n, r, sc)
-
-    st.session_state["ocr_strategy"] = best_name
-    st.session_state["ocr_score"]    = round(best_score, 1)
-    return best_results
-
-
-# ─────────────────────────────────────────────
-# GROQ VISION FALLBACK
-# ─────────────────────────────────────────────
-# Uses Groq's free llama-4-scout-17b-16e-instruct vision model to extract
-# all nutrition values from the image when EasyOCR confidence is low.
-#
-# Setup (one-time):
-#   Option A — Streamlit secrets:  add  GROQ_API_KEY = "gsk_..."  to
-#              .streamlit/secrets.toml  or the Streamlit Cloud dashboard.
-#   Option B — Environment variable:  export GROQ_API_KEY="gsk_..."
-#   Get a free key at: https://console.groq.com  (no credit card needed)
-# ─────────────────────────────────────────────
-
-_GROQ_SYSTEM = """You are a nutrition label parser.
-The user will send an image of a nutrition facts label.
-Extract EVERY nutrient you can read and return ONLY a valid JSON object.
-No markdown, no explanation, no code fences — just the raw JSON.
-
-Required JSON format:
-{
-  "calories": <number or null>,
-  "total_fat": <number or null>,
-  "saturated_fat": <number or null>,
-  "trans_fat": <number or null>,
-  "cholesterol": <number or null>,
-  "sodium": <number or null>,
-  "carbohydrates": <number or null>,
-  "fiber": <number or null>,
-  "sugar": <number or null>,
-  "added_sugar": <number or null>,
-  "protein": <number or null>,
-  "vitamin_d": <number or null>,
-  "calcium": <number or null>,
-  "iron": <number or null>,
-  "potassium": <number or null>,
-  "serving_size_g": <number or null>,
-  "servings_per_container": <number or null>,
-  "product_name": "<string or null>"
-}
-Use null for any nutrient not visible on the label.
-All fat/carb/fiber/sugar/protein values must be in grams (g).
-Cholesterol, sodium, calcium, iron, potassium in milligrams (mg).
-Vitamin D in micrograms (mcg). Calories in kcal."""
-
-
-def _get_groq_key() -> Optional[str]:
-    """Try Streamlit secrets first, then environment variable."""
-    try:
-        key = st.secrets.get("GROQ_API_KEY")
-        if key: return key
-    except Exception:
-        pass
-    import os
-    return os.environ.get("GROQ_API_KEY")
-
-
-def groq_extract(pil_img: Image.Image) -> Optional[Dict[str, Any]]:
-    """
-    Send image to Groq vision API, parse the JSON response.
-    Returns a nutrient dict on success, None on failure.
-    Free tier: 30 requests/minute, 14,400/day — plenty for a nutrition app.
-    """
-    import base64, json, urllib.request, urllib.error
-
-    api_key = _get_groq_key()
-    if not api_key:
-        return None
-
-    # Encode image as base64
-    try:
-        import io
-        # Resize to max 1024px on longest side to stay within Groq's token limits
-        img = pil_img.copy()
-        img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return None
-
-    payload = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "max_tokens": 512,
-        "messages": [
-            {"role": "system", "content": _GROQ_SYSTEM},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    },
-                    {"type": "text", "text": "Extract all nutrition facts from this label."},
-                ],
-            },
-        ],
-    }
-
-    try:
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode())
-        raw = body["choices"][0]["message"]["content"].strip()
-        # Strip any accidental markdown fences
-        raw = re.sub(r"^```(?:json)?", "", raw).strip()
-        raw = re.sub(r"```$", "", raw).strip()
-        return json.loads(raw)
-    except Exception:
-        return None
-
-
-def groq_to_parsed_data(groq_json: Dict, original_data: Dict) -> Dict:
-    """
-    Convert Groq's flat JSON into the app's internal nutrient dict format,
-    only filling in fields that EasyOCR missed.
-    """
-    unit_map = {
-        "calories": "kcal", "total_fat": "g", "saturated_fat": "g",
-        "trans_fat": "g", "cholesterol": "mg", "sodium": "mg",
-        "carbohydrates": "g", "fiber": "g", "sugar": "g",
-        "added_sugar": "g", "protein": "g", "vitamin_d": "mcg",
-        "calcium": "mg", "iron": "mg", "potassium": "mg",
-        "serving_size": "g",
-    }
-    micro = {"vitamin_d", "calcium", "iron", "potassium"}
-
-    for key, unit in unit_map.items():
-        val = groq_json.get(key) or groq_json.get(f"{key}_g") or groq_json.get(f"{key}_mg")
-        if val is None:
-            continue
-        try:
-            val = float(val)
-        except (ValueError, TypeError):
-            continue
-        if val < 0 or val >= 1e5:
-            continue
-        bucket  = "micronutrients" if key in micro else "nutrients"
-        # Only fill gaps — don't overwrite EasyOCR finds
-        if key not in original_data[bucket]:
-            original_data[bucket][key] = {"value": val, "unit": unit, "source": "groq"}
-
-    # serving_size special case
-    ssv = groq_json.get("serving_size_g")
-    if ssv and "serving_size" not in original_data["nutrients"]:
-        try:
-            original_data["nutrients"]["serving_size"] = {"value": float(ssv), "unit": "g", "source": "groq"}
-        except Exception:
-            pass
-
-    if groq_json.get("product_name") and not original_data.get("product_name"):
-        original_data["product_name"] = str(groq_json["product_name"]).title()
-
-    # Re-evaluate confidence after Groq fill
-    core  = {"calories", "protein", "carbohydrates", "total_fat", "sodium"}
-    found = core & original_data["nutrients"].keys()
-    original_data["missing_nutrients"] = list(core - found)
-    original_data["parse_confidence"]  = (
-        "high"   if len(found) >= 4 else
-        "medium" if len(found) >= 2 else "low"
-    )
-    return original_data
-
-
-# ─────────────────────────────────────────────
-# PARSER
-# ─────────────────────────────────────────────
-_FIX = str.maketrans({"O":"0","o":"0","l":"1","I":"1","|":"1","S":"5","B":"8","Z":"2"})
-
-def ocr_num(t: str) -> Optional[float]:
-    c = re.sub(r"[^0-9.]", "", t.translate(_FIX))
-    p = c.split(".")
-    if len(p) > 2: c = p[0] + "." + "".join(p[1:])
-    try:
-        v = float(c)
-        return v if 0 <= v < 1e5 else None
-    except ValueError:
-        return None
-
-def extr(text: str, pats: List[str]) -> Tuple[Optional[float], str]:
-    for pat in pats:
-        m = re.search(pat, text, re.I | re.M)
-        if m:
-            gd = m.groupdict()
-            val = ocr_num(gd.get("val",""))
-            unit = (gd.get("unit") or "").strip().lower()
-            if val is not None:
-                if not unit:
-                    unit = "mg" if "mg" in pat.lower() else "g"
-                return val, unit
-    return None, ""
-
-NPATS: Dict[str, List[str]] = {
-    "serving_size":           [r"serving\s*size[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|ml|oz)",
-                                r"serving\s*size[\s:]+\d+\s+\w+\s*\((?P<val>[\d.]+)\s*(?P<unit>g|ml)\)"],
-    "servings_per_container": [r"(?:about\s*)?(?P<val>[\d.]+)\s*servings?\s*per\s*container",
-                                r"servings?\s*per\s*container[\s:]+(?P<val>[\d.]+)"],
-    "calories":               [r"(?<!\w)calories[\s:]+(?P<val>\d{2,4})(?!\d)",
-                                r"energy[\s:]+(?P<val>\d{2,4})\s*(?:kcal|cal)",
-                                r"^(?P<val>\d{2,4})\s*(?:calories|cal)$"],
-    "total_fat":              [r"total\s*fat[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)",
-                                r"fat,?\s*total[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "saturated_fat":          [r"saturated\s*fat[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)",
-                                r"sat\.?\s*fat[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "trans_fat":              [r"trans\s*fat[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "cholesterol":            [r"cholesterol[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mg|g)"],
-    "sodium":                 [r"sodium[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mg|g)",
-                                r"salt[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mg|g)"],
-    "carbohydrates":          [r"total\s*carbohydrate[s]?[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)",
-                                r"carbohydrate[s]?[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)",
-                                r"(?:^|\n|\s)carbs?[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "fiber":                  [r"dietary\s*fiber[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)",
-                                r"(?:total\s*)?fi(?:ber|bre)[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "sugar":                  [r"total\s*sugars?[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)",
-                                r"sugars?[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "added_sugar":            [r"added\s*sugars?[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "protein":                [r"protein[\s:]+(?P<val>[\d.]+)\s*(?P<unit>g|mg)"],
-    "vitamin_d":              [r"vitamin\s*d[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mcg|µg|iu|mg|%)"],
-    "calcium":                [r"calcium[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mg|g|%)"],
-    "iron":                   [r"iron[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mg|g|%)"],
-    "potassium":              [r"potassium[\s:]+(?P<val>[\d.]+)\s*(?P<unit>mg|g|%)"],
-}
-
-DV_PATS = {
-    "total_fat":     r"total\s*fat[^%\n]{0,25}?(\d+)\s*%",
-    "saturated_fat": r"saturated\s*fat[^%\n]{0,25}?(\d+)\s*%",
-    "cholesterol":   r"cholesterol[^%\n]{0,25}?(\d+)\s*%",
-    "sodium":        r"sodium[^%\n]{0,25}?(\d+)\s*%",
-    "carbohydrates": r"total\s*carbohydrate[^%\n]{0,25}?(\d+)\s*%",
-    "fiber":         r"(?:dietary\s*)?fiber[^%\n]{0,25}?(\d+)\s*%",
-    "protein":       r"protein[^%\n]{0,25}?(\d+)\s*%",
-    "vitamin_d":     r"vitamin\s*d[^%\n]{0,25}?(\d+)\s*%",
-    "calcium":       r"calcium[^%\n]{0,25}?(\d+)\s*%",
-    "iron":          r"iron[^%\n]{0,25}?(\d+)\s*%",
-    "potassium":     r"potassium[^%\n]{0,25}?(\d+)\s*%",
-}
-MICRO_KEYS = {"vitamin_d","calcium","iron","potassium"}
-
-def _bbox_center_y(bbox) -> float:
-    """Return vertical center of an OCR bounding box."""
-    ys = [pt[1] for pt in bbox]
-    return (min(ys) + max(ys)) / 2.0
-
-
-def _bbox_center_x(bbox) -> float:
-    xs = [pt[0] for pt in bbox]
-    return (min(xs) + max(xs)) / 2.0
-
-
-def _group_rows(sorted_res: List[Tuple], row_tol_ratio: float = 0.012) -> List[List[Tuple]]:
-    """
-    Cluster OCR tokens into horizontal rows based on Y proximity.
-    row_tol_ratio: fraction of image height used as row-gap tolerance.
-    Returns list of rows, each row is a list of (bbox, text, conf) sorted by X.
-    """
-    if not sorted_res:
-        return []
-    img_height = max(_bbox_center_y(b) for b, t, c in sorted_res) or 1
-    tol = max(8, img_height * row_tol_ratio)
-
-    rows: List[List[Tuple]] = []
-    current_row: List[Tuple] = [sorted_res[0]]
-    current_y = _bbox_center_y(sorted_res[0][0])
-
-    for item in sorted_res[1:]:
-        cy = _bbox_center_y(item[0])
-        if abs(cy - current_y) <= tol:
-            current_row.append(item)
-        else:
-            rows.append(sorted(current_row, key=lambda x: _bbox_center_x(x[0])))
-            current_row = [item]
-            current_y   = cy
-    if current_row:
-        rows.append(sorted(current_row, key=lambda x: _bbox_center_x(x[0])))
-    return rows
-
-
-# ── Keyword → nutrient key map for positional matching ──
-_KW_MAP = {
-    "energy":         "calories",
-    "calories":       "calories",
-    "calorie":        "calories",
-    "kcal":           "calories",
-    "total fat":      "total_fat",
-    "fat":            "total_fat",
-    "saturated fat":  "saturated_fat",
-    "sat. fat":       "saturated_fat",
-    "sat fat":        "saturated_fat",
-    "trans fat":      "trans_fat",
-    "trans":          "trans_fat",
-    "cholesterol":    "cholesterol",
-    "sodium":         "sodium",
-    "salt":           "sodium",
-    "carbohydrate":   "carbohydrates",
-    "carbohydrates":  "carbohydrates",
-    "total carbohydrate": "carbohydrates",
-    "carbs":          "carbohydrates",
-    "dietary fibre":  "fiber",
-    "dietary fiber":  "fiber",
-    "fibre":          "fiber",
-    "fiber":          "fiber",
-    "total sugars":   "sugar",
-    "sugars":         "sugar",
-    "sugar":          "sugar",
-    "added sugars":   "added_sugar",
-    "protein":        "protein",
-    "vitamin d":      "vitamin_d",
-    "calcium":        "calcium",
-    "iron":           "iron",
-    "potassium":      "potassium",
-}
-
-_UNIT_MAP = {
-    "calories": "kcal", "total_fat": "g", "saturated_fat": "g", "trans_fat": "g",
-    "cholesterol": "mg", "sodium": "mg", "carbohydrates": "g", "fiber": "g",
-    "sugar": "g", "added_sugar": "g", "protein": "g",
-    "vitamin_d": "mcg", "calcium": "mg", "iron": "mg", "potassium": "mg",
-}
-
-
-def _positional_parse(rows: List[List[Tuple]], out: Dict) -> Dict:
-    """
-    Positional row-pair parser.
-
-    Many Indian/Asian nutrition tables use a two-column layout:
-      | Nutrient Name | Value per 100g | Value per serving |
-    or a single-value layout:
-      | Total Carbohydrates | 24.5g |
-
-    Strategy:
-      For each row, check if any token matches a known nutrient keyword.
-      If yes, look for a numeric token in the SAME row (same-row value)
-      or in the NEXT row (below-value layout common in Indian packs).
-    """
-
-    def find_nutrient_in_row(row: List[Tuple]) -> Optional[str]:
-        row_text = " ".join(t.lower() for _, t, _ in row)
-        # Longest-match first
-        for kw in sorted(_KW_MAP.keys(), key=len, reverse=True):
-            if kw in row_text:
-                return _KW_MAP[kw]
-        return None
-
-    def find_numeric_in_row(row: List[Tuple]) -> Tuple[Optional[float], str]:
-        """Return first plausible (value, unit) in row."""
-        row_text = " ".join(t for _, t, _ in row)
-        # Pattern: number optionally followed by unit
-        m = re.search(r"(?<!\d)([\d]+(?:[.,]\d+)?)\s*(g|mg|mcg|µg|kcal|cal|%)?(?!\d)",
-                      row_text, re.I)
-        if m:
-            raw = m.group(1).replace(",",".")
-            v   = ocr_num(raw)
-            u   = (m.group(2) or "").lower().strip()
-            return v, u
-        return None, ""
-
-    n_rows = len(rows)
-    for i, row in enumerate(rows):
-        nut_key = find_nutrient_in_row(row)
-        if nut_key is None:
-            continue
-        # Skip if already parsed with higher confidence
-        bucket = "micronutrients" if nut_key in MICRO_KEYS else "nutrients"
-        if nut_key in out[bucket]:
-            continue
-
-        # 1. Try same row first (most common for inline tables)
-        val, unit = find_numeric_in_row(row)
-
-        # 2. If not found, try the next row (value-below layout)
-        if val is None and i + 1 < n_rows:
-            val, unit = find_numeric_in_row(rows[i + 1])
-
-        # 3. If still not found, try combining this row + next as one text
-        if val is None and i + 1 < n_rows:
-            combined_text = " ".join(t for _, t, _ in (row + rows[i+1]))
-            m2 = re.search(r"(?<!\d)([\d]+(?:[.,]\d+)?)\s*(g|mg|mcg|µg|kcal|cal|%)?(?!\d)",
-                           combined_text, re.I)
-            if m2:
-                val = ocr_num(m2.group(1).replace(",","."))
-                unit = (m2.group(2) or "").lower().strip()
-
-        if val is not None and val < 1e5:
-            # Infer unit if not captured
-            if not unit:
-                unit = _UNIT_MAP.get(nut_key, "g")
-            out[bucket][nut_key] = {"value": val, "unit": unit, "source": "positional"}
-
-    return out
-
-
-def parse_label(ocr_res: List[Tuple]) -> Dict[str, Any]:
-    """
-    Three-pass parser:
-      Pass 1 — Regex on full text (existing, fast)
-      Pass 2 — Positional row-pair matching (new; fixes sodium/carbs on tabular labels)
-      Pass 3 — Regex on single joined line (line-wrap OCR fallback)
-    Results from earlier passes are kept; later passes only fill gaps.
-    """
-    sorted_res = sorted(ocr_res, key=lambda r: _bbox_center_y(r[0]))
-    texts, hi_conf = [], []
-    for bbox, text, conf in sorted_res:
-        texts.append(text)
-        if conf > 0.4:
-            hi_conf.append(text)
-
-    full   = "\n".join(texts)
-    full_l = full.lower()
-    join_l = " ".join(texts).lower()
-
-    out: Dict[str, Any] = {
-        "raw_text": full, "nutrients": {}, "daily_values": {},
-        "micronutrients": {}, "product_name": None, "brand": None,
-        "parse_confidence": "low", "missing_nutrients": [],
-    }
-
-    # ── Pass 1: regex on newline-structured text ──
-    for key, pats in NPATS.items():
-        val, unit = extr(full_l, pats)
-        if val is not None:
-            bucket = "micronutrients" if key in MICRO_KEYS else "nutrients"
-            out[bucket][key] = {"value": val, "unit": unit, "source": "regex"}
-
-    # ── Pass 2: positional row-pair matching ──
-    rows = _group_rows(sorted_res)
-    out  = _positional_parse(rows, out)
-
-    # ── Pass 3: regex on single joined line (line-wrap fallback) ──
-    for key, pats in NPATS.items():
-        bucket = "micronutrients" if key in MICRO_KEYS else "nutrients"
-        if key not in out[bucket]:
-            val, unit = extr(join_l, pats)
-            if val is not None:
-                out[bucket][key] = {"value": val, "unit": unit, "source": "joined"}
-
-    # ── Daily values ──
-    for key, pat in DV_PATS.items():
-        m = re.search(pat, full_l, re.I)
-        if m:
-            dv = ocr_num(m.group(1))
-            if dv is not None:
-                out["daily_values"][key] = dv
-
-    # ── Product name ──
-    nf = full_l.find("nutrition facts")
-    if nf > 0:
-        lines = [l.strip() for l in full[:nf].split("\n") if l.strip() and len(l.strip()) > 2]
-        if lines: out["product_name"] = lines[-1].title()
-    elif hi_conf:
-        for t in hi_conf[:5]:
-            if not re.match(r"^\d", t) and len(t) > 3:
-                out["product_name"] = t.strip().title(); break
-
-    # ── Confidence ──
-    core  = {"calories","protein","carbohydrates","total_fat","sodium"}
-    found = core & out["nutrients"].keys()
-    out["missing_nutrients"] = list(core - found)
-    out["parse_confidence"]  = "high" if len(found) >= 4 else ("medium" if len(found) >= 2 else "low")
-    return out
-
-def apply_overrides(data: Dict, ov: Dict[str, Optional[float]]) -> Dict:
-    umap = {"calories":"kcal","total_fat":"g","saturated_fat":"g","trans_fat":"g",
-            "carbohydrates":"g","fiber":"g","sugar":"g","protein":"g","sodium":"mg"}
-    for k, v in ov.items():
-        if v is not None and v >= 0:
-            bucket = "micronutrients" if k in MICRO_KEYS else "nutrients"
-            data[bucket][k] = {"value": float(v), "unit": umap.get(k,"g"), "manual": True}
-    core  = {"calories","protein","carbohydrates","total_fat","sodium"}
-    found = core & data["nutrients"].keys()
-    data["missing_nutrients"] = list(core - found)
-    data["parse_confidence"]  = "high" if len(found) >= 4 else ("medium" if len(found) >= 2 else "low")
-    return data
-
+from ocr_engine import (
+    run_ocr, parse_label, apply_overrides,
+    groq_extract, groq_to_parsed_data, _get_groq_key,
+    ocr_num, MICRO_KEYS,
+)
 
 # ─────────────────────────────────────────────
 # HEALTH SCORING  (5-dimension, category-aware)
+
 # ─────────────────────────────────────────────
 def _g(data: Dict, key: str) -> Optional[float]:
     n = data.get("nutrients", {}).get(key)
@@ -918,7 +324,7 @@ def score_label(data: Dict, profile: Dict, cat: Dict) -> Dict[str, Any]:
     sat = _g(data,"saturated_fat")
     trans = _g(data,"trans_fat")
     fs = 20; fr = "Good fat quality"; fc = "good"
-    if trans is not None and trans > 0.1:  # ignore OCR noise / "0g" labels
+    if trans is not None and trans > 0.2:  # ignore OCR noise / "0g" labels
         fs -= 12; R["flags"].append("🚨 Trans fat detected — strongly linked to cardiovascular disease.")
         R["tags"].append({"l":"Trans Fat ⚠️","c":"tb"})
     if sat is not None:
@@ -1082,7 +488,8 @@ def dv_fig(data: Dict) -> go.Figure:
 def bmi_fig(bmi: float, color: str) -> go.Figure:
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=bmi,
-        number={"font":{"size":44,"color":color,"family":"Playfair Display"}},
+        number={"font":{"size":48,"color":color,"family":"Playfair Display"},
+                "valueformat":".1f"},
         domain={"x":[0,1],"y":[0,1]},
         gauge={"axis":{"range":[10,45],"tickcolor":P["muted"],"tickfont":{"color":P["muted"],"size":9}},
                "bar":{"color":color,"thickness":.22},"bgcolor":P["surface2"],"borderwidth":0,
@@ -1090,8 +497,13 @@ def bmi_fig(bmi: float, color: str) -> go.Figure:
                         {"range":[18.5,25],"color":"rgba(92,184,138,.13)"},
                         {"range":[25,30],"color":"rgba(232,136,74,.13)"},
                         {"range":[30,45],"color":"rgba(217,85,85,.13)"}]}))
-    fig.update_layout(height=230,margin=dict(l=30,r=30,t=20,b=20),
-                      paper_bgcolor="rgba(0,0,0,0)",font={"color":P["text"]})
+    fig.update_layout(
+        height=260,
+        margin=dict(l=40,r=40,t=30,b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font={"color":P["text"]},
+        autosize=True,
+    )
     return fig
 
 
@@ -1302,14 +714,20 @@ def render_topbar():
         from auth import update_profile
         update_profile(auth_user, p)
 
-    # Hidden AI key (no sidebar needed)
-    if not _get_groq_key():
-        with st.expander("⚙️ Settings", expanded=False):
-            runtime_key = st.text_input("Enhancement key (optional)", type="password",
+    # Settings expander — Groq key + Supabase status
+    with st.expander("⚙️ Settings", expanded=False):
+        if not _get_groq_key():
+            runtime_key = st.text_input("Groq API key (optional — faster AI)", type="password",
                                         key="groq_rt_key", label_visibility="visible")
             if runtime_key and runtime_key.startswith("gsk_"):
                 import os; os.environ["GROQ_API_KEY"] = runtime_key
                 st.rerun()
+        else:
+            st.markdown("<span style='color:#5cb88a;font-size:.8rem;'>✓ Groq key active</span>", unsafe_allow_html=True)
+        _sb_on = supabase_enabled()
+        _sb_color = "#5cb88a" if _sb_on else "#666b8a"
+        _sb_label = "✓ Supabase connected — scans sync to cloud" if _sb_on else "○ Supabase not configured — using local storage"
+        st.markdown(f"<span style='color:{_sb_color};font-size:.8rem;'>{_sb_label}</span>", unsafe_allow_html=True)
 
     st.markdown(f"<hr style='margin:.5rem 0 1rem;border-color:{_bdr2};'>", unsafe_allow_html=True)
     return p
@@ -1532,6 +950,250 @@ def render_bmi(user_profile):
         st.markdown("</div>",unsafe_allow_html=True)
 
 
+
+# ─────────────────────────────────────────────
+# AI ADVISOR TAB
+# ─────────────────────────────────────────────
+def _groq_chat(messages: list, system: str, max_tokens: int = 800) -> str:
+    """
+    Calls Groq's free llama3-8b-8192 model.
+    Requires GROQ_API_KEY in .streamlit/secrets.toml or as env var.
+    Free tier: 30 req/min, 14,400/day — no credit card needed.
+    Get key at: https://console.groq.com
+    """
+    import json, urllib.request, urllib.error
+    key = _get_groq_key()
+    if not key:
+        return (
+            "🔑 **AI features need a free Groq API key.**\n\n"
+            "1. Go to [console.groq.com](https://console.groq.com) — sign up free\n"
+            "2. Create an API key (starts with `gsk_`)\n"
+            "3. Add to `.streamlit/secrets.toml`:\n"
+            "```\nGROQ_API_KEY = \"gsk_your_key_here\"\n```\n"
+            "4. Restart the app — AI features will work instantly."
+        )
+    payload = {
+        "model": "llama3-8b-8192",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "system", "content": system}] + messages,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            body = json.loads(resp.read().decode())
+        return body["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()[:200]
+        return f"⚠️ Groq error {e.code}: {err}"
+    except Exception as e:
+        return f"⚠️ AI request failed: {e}"
+
+
+def render_ai_advisor(user_profile: dict, goal_profile: dict):
+    """AI Advisor tab — chat, meal suggestions, weekly summary, label explainer."""
+    from ocr_engine import _get_groq_key
+
+    has_key = bool(_get_groq_key())
+    last_scan = st.session_state.history[0] if st.session_state.history else None
+
+    # Build user context string for all prompts
+    w, h, age, sex = (user_profile.get("weight_kg",0), user_profile.get("height_cm",0),
+                      user_profile.get("age",0), user_profile.get("sex","Male"))
+    goal = user_profile.get("goal","Balanced")
+    ctx  = f"User: {sex}, age {age}, {w}kg, {h}cm, goal: {goal}."
+    if last_scan:
+        ctx += (f" Last scanned: {last_scan['product']} "
+                f"(score {last_scan['score']}/100, grade {last_scan['grade']}, "
+                f"category {last_scan.get('category','')}).")
+    if st.session_state.history:
+        avg = round(sum(e["score"] for e in st.session_state.history) / len(st.session_state.history))
+        ctx += f" Average scan score: {avg}/100 across {len(st.session_state.history)} scans."
+
+    if not has_key:
+        st.markdown(
+            "<div style='background:rgba(240,165,0,.07);border:1px solid rgba(240,165,0,.2);"
+            "border-radius:10px;padding:.8rem 1rem;font-size:.85rem;color:#eceef8;margin-bottom:.75rem;'>"
+            "🔑 <b>Add a free Groq API key</b> to unlock AI features.<br>"
+            "<span style='color:#666b8a;font-size:.78rem;'>"
+            "Get one free at <a href='https://console.groq.com' target='_blank' style='color:#f0a500;'>console.groq.com</a>"
+            " → paste in ⚙️ Settings above. No credit card needed.</span></div>",
+            unsafe_allow_html=True
+        )
+
+    ai_tab1, ai_tab2, ai_tab3, ai_tab4 = st.tabs([
+        "💬 Chat", "🍽️ Meal Ideas", "📅 Weekly Summary", "🔍 Explain My Scan"
+    ])
+
+    # ── Tab 1: Free Chat ────────────────────────────────────────────────────
+    with ai_tab1:
+        st.markdown(f'<div class="sec-hdr">💬 Ask Anything About Nutrition</div>', unsafe_allow_html=True)
+
+        if "ai_chat_history" not in st.session_state:
+            st.session_state.ai_chat_history = []
+
+        # Display chat history
+        for msg in st.session_state.ai_chat_history:
+            role_color = P["accent"] if msg["role"] == "user" else P["good"]
+            role_label = "You" if msg["role"] == "user" else "NutriScan AI"
+            st.markdown(
+                f"<div style='margin:.5rem 0;padding:.7rem 1rem;border-radius:10px;"
+                f"background:{P['surface2']};border-left:3px solid {role_color};'>"
+                f"<span style='font-size:.72rem;color:{role_color};font-weight:600;"
+                f"letter-spacing:.05em;'>{role_label}</span>"
+                f"<p style='margin:.25rem 0 0;font-size:.88rem;color:{P['text']};'>{msg['content']}</p>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+        user_q = st.text_input("Ask about ingredients, nutrients, diet tips…",
+                               placeholder="e.g. Is 37g carbs too much for dinner?",
+                               key="ai_chat_input", label_visibility="collapsed")
+        c1, c2 = st.columns([4, 1])
+        with c2:
+            send = st.button("Send →", key="ai_send", use_container_width=True)
+        with c1:
+            if st.button("Clear chat", key="ai_clear"):
+                st.session_state.ai_chat_history = []
+                st.rerun()
+
+        if send and user_q.strip():
+            st.session_state.ai_chat_history.append({"role": "user", "content": user_q})
+            with st.spinner("Thinking…"):
+                system = (
+                    "You are NutriScan AI, a concise, friendly nutrition expert. "
+                    "Give practical, evidence-based advice. Keep responses under 150 words. "
+                    "Never recommend medical treatment. Always be encouraging. "
+                    + ctx
+                )
+                reply = _groq_chat(st.session_state.ai_chat_history, system)
+            st.session_state.ai_chat_history.append({"role": "assistant", "content": reply})
+            st.rerun()
+
+    # ── Tab 2: Meal Ideas ───────────────────────────────────────────────────
+    with ai_tab2:
+        st.markdown(f'<div class="sec-hdr">🍽️ Personalised Meal Ideas</div>', unsafe_allow_html=True)
+
+        m1, m2 = st.columns(2)
+        with m1:
+            meal_type = st.selectbox("Meal", ["Breakfast","Lunch","Dinner","Snack"], key="meal_type")
+            cuisine   = st.selectbox("Cuisine preference", ["Any","Indian","Mediterranean","Asian","Western","Mexican"], key="meal_cuisine")
+        with m2:
+            avoid     = st.text_input("Avoid / allergies", placeholder="e.g. gluten, dairy, nuts", key="meal_avoid")
+            cal_target= st.number_input("Calorie target (kcal)", 0, 2000, 500, 50, key="meal_cal")
+
+        if st.button("✨ Generate Meal Ideas", key="meal_gen", use_container_width=True):
+            with st.spinner("Crafting meal ideas…"):
+                prompt = (
+                    f"Suggest 3 {meal_type} meal ideas for someone with goal: {goal}. "
+                    f"Cuisine: {cuisine}. Avoid: {avoid or 'nothing'}. "
+                    f"Target ~{cal_target} kcal per meal. "
+                    f"For each: name, ~calories, key macros, and why it fits the goal. "
+                    f"Format as a numbered list. Keep it concise and practical."
+                )
+                system = "You are a friendly dietitian specialising in practical meal planning. " + ctx
+                reply  = _groq_chat([{"role": "user", "content": prompt}], system, max_tokens=600)
+            st.markdown(
+                f"<div class='ns-card' style='margin-top:.5rem;'>{reply.replace(chr(10), '<br>')}</div>",
+                unsafe_allow_html=True
+            )
+
+    # ── Tab 3: Weekly Summary ───────────────────────────────────────────────
+    with ai_tab3:
+        st.markdown(f'<div class="sec-hdr">📅 Weekly Health Summary</div>', unsafe_allow_html=True)
+
+        history = st.session_state.history
+        if len(history) < 2:
+            st.info("Scan at least 2 products to generate a weekly summary.")
+        else:
+            recent = history[:min(20, len(history))]
+            scan_list = chr(10).join("- "+e["product"]+" | Score "+str(e["score"])+"/100 | Grade "+e["grade"]+" | "+e.get("category","")+" | "+str(e.get("calories","?"))+" kcal" for e in recent)
+            if st.button("📊 Generate My Health Summary", key="summary_gen", use_container_width=True):
+                with st.spinner("Analysing your scan history…"):
+                    prompt = (
+                        "Here are the user's recent food scans:\n" + scan_list + "\n\n"
+                        "Write a brief, encouraging weekly nutrition summary. Include:\n"
+                        "1. Overall pattern (2 sentences)\n"
+                        "2. Top 2 strengths\n"
+                        "3. Top 2 areas to improve\n"
+                        "4. One actionable tip for next week\n"
+                        "Keep it under 200 words. Be positive and specific."
+                    )
+                    system = "You are a supportive nutrition coach reviewing a client's food diary. " + ctx
+                    reply  = _groq_chat([{"role": "user", "content": prompt}], system, max_tokens=400)
+                st.markdown(
+                    f"<div class='ns-card'>{reply.replace(chr(10), '<br>')}</div>",
+                    unsafe_allow_html=True
+                )
+
+            # Show score trend mini chart
+            if len(recent) >= 3:
+                import plotly.graph_objects as pgo
+                scores  = [e["score"] for e in reversed(recent)]
+                colours = [P["good"] if s>=70 else (P["warn"] if s>=45 else P["bad"]) for s in scores]
+                fig = pgo.Figure(pgo.Bar(y=scores, marker_color=colours,
+                                        hovertemplate="%{y}/100<extra></extra>"))
+                fig.update_layout(
+                    height=160, margin=dict(l=0,r=0,t=10,b=0),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showticklabels=False), yaxis=dict(range=[0,105], color=P["muted"]),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    # ── Tab 4: Explain My Scan ──────────────────────────────────────────────
+    with ai_tab4:
+        st.markdown(f'<div class="sec-hdr">🔍 Explain My Last Scan</div>', unsafe_allow_html=True)
+
+        if not last_scan:
+            st.info("Scan a product first to get an AI explanation.")
+        else:
+            parsed = st.session_state.get("parsed_data")
+            nutrients_txt = ""
+            if parsed:
+                for k, v in parsed.get("nutrients", {}).items():
+                    if isinstance(v, dict):
+                        nutrients_txt += f"{k.replace('_',' ').title()}: {v.get('value')} {v.get('unit')}  "
+
+            explain_mode = st.radio("What do you want explained?",
+                                    ["Plain English summary", "Is this healthy for me?",
+                                     "What are the concerning ingredients?",
+                                     "How does this fit my daily goal?"],
+                                    key="explain_mode", horizontal=True)
+
+            if st.button("🤖 Explain Now", key="explain_btn", use_container_width=True):
+                with st.spinner("Analysing…"):
+                    prompts = {
+                        "Plain English summary":
+                            f"Explain this nutrition label in simple plain English for someone with no nutrition knowledge. "
+                            f"Product: {last_scan['product']}. Nutrients: {nutrients_txt}. Score: {last_scan['score']}/100.",
+                        "Is this healthy for me?":
+                            f"Based on my profile and goal ({goal}), is {last_scan['product']} a good choice? "
+                            f"Nutrients: {nutrients_txt}. Score: {last_scan['score']}/100. Give a direct yes/no with brief reasoning.",
+                        "What are the concerning ingredients?":
+                            f"What should I be concerned about in {last_scan['product']}? "
+                            f"Nutrients: {nutrients_txt}. Focus on anything above recommended daily limits.",
+                        "How does this fit my daily goal?":
+                            f"I have a {goal} goal. I just ate {last_scan['product']} ({last_scan.get('calories','?')} kcal). "
+                            f"How does this fit into my day? What should I eat for my remaining meals? "
+                            f"Nutrients: {nutrients_txt}.",
+                    }
+                    system = "You are a concise, friendly nutritionist. Keep answers under 180 words. Be specific and practical. " + ctx
+                    reply  = _groq_chat([{"role": "user", "content": prompts[explain_mode]}], system, max_tokens=400)
+                st.markdown(
+                    f"<div class='ns-card'>"
+                    f"<div class='sec-hdr'>💡 {explain_mode}</div>"
+                    f"{reply.replace(chr(10), '<br>')}"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -1550,7 +1212,7 @@ def main():
     user_profile = render_topbar()
     goal_profile = GOAL_PROFILES[user_profile["goal"]]
 
-    tab_scan, tab_bmi, tab_dash = st.tabs(["🔬 Scan Label","⚖️ BMI & Energy","📊 My Dashboard"])
+    tab_scan, tab_bmi, tab_dash, tab_ai = st.tabs(["🔬 Scan Label","⚖️ BMI & Energy","📊 My Dashboard","🤖 AI Advisor"])
 
     # ── SCAN TAB ──────────────────────────────
     with tab_scan:
@@ -1598,9 +1260,9 @@ def main():
             st.markdown("</div>",unsafe_allow_html=True)
 
         with res_col:
+            # ── Run OCR when Analyse button clicked ───────────────────────────
             if uploaded and analyse:
-                # ── Step 1: EasyOCR ──────────────────────────────────────────
-                with st.spinner("🔍 Running OCR…"):
+                with st.spinner("🔍 Scanning label…"):
                     try:
                         ocr_res = run_ocr(pil_img)
                     except Exception as e:
@@ -1608,90 +1270,105 @@ def main():
                         ocr_res = []
 
                 if not ocr_res:
-                    st.error("OCR returned no text. Try a clearer image, or add your Groq API key for AI-powered extraction.")
+                    st.error("OCR returned no text. Try a clearer, well-lit photo.")
                 else:
                     data    = parse_label(ocr_res)
                     pc      = data.get("parse_confidence", "low")
                     missing = data.get("missing_nutrients", [])
-                    strat   = st.session_state.get("ocr_strategy", "—")
 
-                    # ── Step 2: Groq Vision Fallback ─────────────────────────────
-                    # Triggers automatically if EasyOCR confidence is still low/medium
-                    # or any core nutrient is missing. Requires GROQ_API_KEY.
-                    groq_used = False
-                    groq_available = bool(_get_groq_key())
-
-                    if (pc in ("low", "medium") or missing) and groq_available:
-                        with st.spinner("🤖 EasyOCR partial — trying Groq vision AI…"):
+                    # Groq vision fallback if confidence is low
+                    if (pc in ("low", "medium") or missing) and bool(_get_groq_key()):
+                        with st.spinner("Enhancing with AI…"):
                             groq_json = groq_extract(pil_img)
                             if groq_json:
-                                data     = groq_to_parsed_data(groq_json, data)
-                                pc       = data.get("parse_confidence", "low")
-                                missing  = data.get("missing_nutrients", [])
-                                groq_used = True
+                                data    = groq_to_parsed_data(groq_json, data)
+                                pc      = data.get("parse_confidence", "low")
+                                missing = data.get("missing_nutrients", [])
 
-                    # ── Confidence banner ──────────────────────────────────────────
-                    groq_badge = ""  # internal detail, not shown to user
-                    ocr_badge  = f" · OCR: {strat}"
-                    prod_name  = data.get("product_name") or "Scanned Product"
+                    # Apply user-typed name/notes before storing
+                    if manual_name.strip():
+                        data["product_name"] = manual_name.strip().title()
+                    if scan_notes.strip():
+                        data["notes"] = scan_notes.strip()
 
-                    if pc == "high":
-                        st.success(f"✅ High confidence parse{groq_badge}{ocr_badge} · {prod_name}")
-                    elif pc == "medium":
-                        st.warning(f"⚠️ Partial parse{groq_badge} — fill in missing values below if needed.")
+                    # Store everything in session_state so reruns keep the result
+                    st.session_state["parsed_data"]    = data
+                    st.session_state["parsed_pc"]      = pc
+                    st.session_state["parsed_missing"] = missing
+                    st.session_state["parsed_cat"]     = sel_cat
+                    st.session_state["parsed_cat_cfg"] = cat_cfg
+                    st.session_state["scan_saved"]     = False  # reset so history saves once
+
+            # ── Render from session_state (survives Apply button reruns) ─────
+            data     = st.session_state.get("parsed_data")
+            pc       = st.session_state.get("parsed_pc", "low")
+            missing  = st.session_state.get("parsed_missing", [])
+            r_cat    = st.session_state.get("parsed_cat", sel_cat)
+            r_catcfg = st.session_state.get("parsed_cat_cfg", cat_cfg)
+
+            if data:
+                strat = st.session_state.get("ocr_strategy", "—")
+
+                # Confidence banner
+                prod_name = data.get("product_name") or "Scanned Product"
+                if pc == "high":
+                    st.success(f"✅ High confidence · {prod_name} · OCR: {strat}")
+                elif pc == "medium":
+                    st.warning(f"⚠️ Partial parse — fill in missing values below if needed.")
+                else:
+                    if not bool(_get_groq_key()):
+                        st.error("⚠️ Low confidence. Fill in values below or add a Groq key for AI-powered extraction.")
                     else:
-                        if not groq_available:
-                            st.error(
-                                f"⚠️ Low OCR confidence ({strat} strategy). "
-                                "**Add a free Groq API key** to enable AI-powered fallback — "
-                                "get one at [console.groq.com](https://console.groq.com) and set "
-                                "`GROQ_API_KEY` in `.streamlit/secrets.toml`."
-                            )
-                        else:
-                            st.error("⚠️ Low confidence scan. Please fill in values manually below.")
+                        st.error("⚠️ Low confidence. Fill in values manually below.")
 
-                    st.session_state["parsed_data"] = data
+                # Manual entry form — stays visible across reruns
+                if pc in ("low", "medium") or missing:
+                    ov = fallback_form(missing, data)
+                    if st.button("✅ Apply Manual Values & Score", key="apply_btn"):
+                        data = apply_overrides(data, {k: v for k, v in ov.items() if v is not None})
+                        st.session_state["parsed_data"]    = data
+                        st.session_state["parsed_pc"]      = data.get("parse_confidence","low")
+                        st.session_state["parsed_missing"] = data.get("missing_nutrients",[])
+                        st.session_state["scan_saved"]     = False
+                        st.rerun()
 
-                    # ── Step 3: Manual entry form (last resort) ────────────────────
-                    if pc in ("low", "medium") or missing:
-                        ov = fallback_form(missing, data)
-                        if st.button("✅ Apply Manual Values & Score", key="apply_btn"):
-                            data = apply_overrides(data, {k: v for k, v in ov.items() if v is not None})
-                            st.session_state["parsed_data"] = data
-
-                    # ── Render analysis ────────────────────────────────────────────
-                    try:
-                        # User-typed name takes priority over OCR-detected name
-                        if manual_name.strip():
-                            data["product_name"] = manual_name.strip().title()
-                        if scan_notes.strip():
-                            data["notes"] = scan_notes.strip()
-                        sr   = score_label(data, goal_profile, cat_cfg)
+                # Render analysis + save history (only once per scan)
+                try:
+                    sr = score_label(data, goal_profile, r_catcfg)
+                    if not st.session_state.get("scan_saved", False):
                         name = data.get("product_name") or "Scanned Product"
-                        save_history(name, sr["total"], sr["grade"], sel_cat, data)
-                        render_analysis(data, sr, goal_profile, user_profile, cat_cfg, sel_cat)
-                    except Exception as e:
-                        st.error(f"Analysis rendering failed: {e}")
-                        st.info("Tips: high-res photo, flat angle, good lighting.")
+                        save_history(name, sr["total"], sr["grade"], r_cat, data)
+                        st.session_state["scan_saved"] = True
+                    render_analysis(data, sr, goal_profile, user_profile, r_catcfg, r_cat)
+                except Exception as e:
+                    st.error(f"Analysis rendering failed: {e}")
+                    st.info("Tips: high-res photo, flat angle, good lighting.")
 
             elif not uploaded:
                 last = st.session_state.history[0] if st.session_state.history else None
                 if last:
-                    lc = P["good"] if last["score"]>=70 else (P["warn"] if last["score"]>=45 else P["bad"])
-                    st.markdown(f"""
-                    <div class="ns-card" style="margin-top:.5rem;">
-                        <div class="sec-hdr">🕐 Last Scanned</div>
-                        <div style="display:flex;align-items:center;gap:1.2rem;padding:.4rem 0;">
-                            <div style="font-family:'Playfair Display',serif;font-size:2.8rem;color:{lc};font-weight:700;min-width:52px;text-align:center;">{last["grade"]}</div>
-                            <div>
-                                <div style="font-size:1rem;font-weight:600;color:{P["text"]};">{last["product"]}</div>
-                                <div style="font-size:.78rem;color:{P["muted"]};margin:.1rem 0;">{last.get("category","")} · {last["timestamp"]}</div>
-                                <div style="font-size:.85rem;color:{lc};font-weight:600;">{last["score"]}/100</div>
-                                {f'<div style="font-size:.72rem;color:{P["muted"]};font-style:italic;margin-top:.2rem;">{last["notes"][:50]}</div>' if last.get("notes") else ""}
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    lc       = P["good"] if last["score"]>=70 else (P["warn"] if last["score"]>=45 else P["bad"])
+                    _txt     = P["text"]
+                    _muted   = P["muted"]
+                    _grade   = last["grade"]
+                    _product = last["product"]
+                    _cat     = last.get("category","")
+                    _ts      = last["timestamp"]
+                    _score   = last["score"]
+                    _notes_h = f"<div style='font-size:.72rem;color:{_muted};font-style:italic;margin-top:.2rem;'>{last['notes'][:50]}</div>" if last.get("notes") else ""
+                    st.markdown(
+                        f"<div class='ns-card' style='margin-top:.5rem;'>"
+                        f"<div class='sec-hdr'>🕐 Last Scanned</div>"
+                        f"<div style='display:flex;align-items:center;gap:1.2rem;padding:.4rem 0;'>"
+                        f"<div style='font-family:Playfair Display,serif;font-size:2.8rem;color:{lc};font-weight:700;min-width:52px;text-align:center;'>{_grade}</div>"
+                        f"<div>"
+                        f"<div style='font-size:1rem;font-weight:600;color:{_txt};'>{_product}</div>"
+                        f"<div style='font-size:.78rem;color:{_muted};margin:.1rem 0;'>{_cat} · {_ts}</div>"
+                        f"<div style='font-size:.85rem;color:{lc};font-weight:600;'>{_score}/100</div>"
+                        f"{_notes_h}"
+                        f"</div></div></div>",
+                        unsafe_allow_html=True
+                    )
                 else:
                     st.markdown("""<div style='text-align:center;padding:5rem 2rem;color:#666b8a;'>
                     <div style='font-size:3.5rem;margin-bottom:1rem;'>🔬</div>
@@ -1706,8 +1383,11 @@ def main():
     with tab_dash:
         render_dashboard()
 
+    with tab_ai:
+        render_ai_advisor(user_profile, goal_profile)
+
     st.markdown("---")
-    st.markdown(f"<p style='text-align:center;color:{P['border']};font-size:.7rem;'>NutriScan v1.2 · Multi-strategy OCR · Local & Offline · Not a substitute for medical/dietary advice</p>",unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align:center;color:{P['border']};font-size:.7rem;'>NutriScan v1.2 · Multi-strategy OCR · Not a substitute for medical/dietary advice</p>",unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

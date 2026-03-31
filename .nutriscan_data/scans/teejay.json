@@ -1,0 +1,34 @@
+[
+  {
+    "product": "Nutrition Facts",
+    "category": "\ud83c\udff7\ufe0f Other / Unknown",
+    "score": 68,
+    "grade": "C",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 4.0,
+      "calories": 240.0,
+      "sugar": 4.0,
+      "total_fat": 20.0,
+      "protein": 11.0,
+      "sodium": 540.0,
+      "carbohydrates": 12.0
+    },
+    "saved_at": "2026-03-30T14:57:11.050819"
+  },
+  {
+    "product": "Nutrition Facts",
+    "category": "\ud83c\udff7\ufe0f Other / Unknown",
+    "score": 71,
+    "grade": "B",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 4.0,
+      "calories": 240.0,
+      "sugar": 4.0
+    },
+    "saved_at": "2026-03-30T14:56:07.708952"
+  }
+]
