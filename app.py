@@ -570,6 +570,7 @@ def save_history(name, score, grade_l, cat_lbl, data):
     if len(st.session_state.history) > 20:
         st.session_state.history = st.session_state.history[:20]
     # Persist to user account if logged in
+    # (Logging happens in database.py - save_scan_db() prints to terminal)
     persist_scan(
         username=st.session_state.get("auth_user"),
         product_name=name,
@@ -956,12 +957,11 @@ def render_bmi(user_profile):
 # ─────────────────────────────────────────────
 def _groq_chat(messages: list, system: str, max_tokens: int = 800) -> str:
     """
-    Calls Groq's free llama3-8b-8192 model.
+    Calls Groq's llama-3.1-8b-instant model for fast, free text generation.
     Requires GROQ_API_KEY in .streamlit/secrets.toml or as env var.
     Free tier: 30 req/min, 14,400/day — no credit card needed.
     Get key at: https://console.groq.com
     """
-    import json, urllib.request, urllib.error
     key = _get_groq_key()
     if not key:
         return (
@@ -972,27 +972,31 @@ def _groq_chat(messages: list, system: str, max_tokens: int = 800) -> str:
             "```\nGROQ_API_KEY = \"gsk_your_key_here\"\n```\n"
             "4. Restart the app — AI features will work instantly."
         )
-    payload = {
-        "model": "llama3-8b-8192",
-        "max_tokens": max_tokens,
-        "messages": [{"role": "system", "content": system}] + messages,
-    }
+    
     try:
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {key}"},
-            method="POST",
+        from groq import Groq
+    except ImportError:
+        return "⚠️ Groq SDK not installed. Run: pip install groq>=0.4.0"
+    
+    try:
+        client = Groq(api_key=key)
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",  # Fast, free, and currently available
+            max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system}] + messages,
+            temperature=0.7,
         )
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            body = json.loads(resp.read().decode())
-        return body["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        err = e.read().decode()[:200]
-        return f"⚠️ Groq error {e.code}: {err}"
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"⚠️ AI request failed: {e}"
+        error_msg = str(e)
+        if "401" in error_msg or "Unauthorized" in error_msg:
+            return "⚠️ Groq API key is invalid. Update it in ⚙️ Settings."
+        elif "429" in error_msg:
+            return "⚠️ Rate limit hit. Wait 1 minute and try again."
+        elif "decommissioned" in error_msg:
+            return "⚠️ The model is no longer available. Try again later."
+        else:
+            return f"⚠️ AI error: {error_msg[:100]}"
 
 
 def render_ai_advisor(user_profile: dict, goal_profile: dict):

@@ -21,6 +21,9 @@ import secrets
 import datetime
 from typing import Optional, Dict, List
 
+# Import Supabase scan saving
+from database import save_scan_db
+
 # ── Storage paths (local, Phase 1) ───────────────────────────────────────────
 _DATA_DIR   = os.path.join(os.path.dirname(__file__), ".nutriscan_data")
 _USERS_FILE = os.path.join(_DATA_DIR, "users.json")
@@ -384,7 +387,7 @@ def persist_scan(
         "notes":     notes,
         "nutrients": {k: v.get("value") for k, v in nutrients.items() if isinstance(v, dict)},
     }
-    save_user_scan(username, scan)
+    save_scan_db(username, scan)
 
 
 # ─────────────────────────────────────────────
@@ -584,10 +587,10 @@ def render_dashboard():
             col_main, col_del = st.columns([10,1])
             with col_main:
                 _muted   = P["muted"]
-                _note    = s.get("notes", "")[:40]
-                _cat     = s.get("category","")[:22]
+                _note    = (s.get("notes") or "")[:40]
+                _cat     = (s.get("category") or "")[:22]
                 _brand   = ("· " + s["brand"]) if s.get("brand") else ""
-                _date    = s.get("saved_at","")[:10]
+                _date    = (s.get("saved_at") or "")[:10]
                 _grade   = s.get("grade","?")
                 _notes_s = f"<span style='color:{_muted};font-style:italic;'> · {_note}</span>" if _note else ""
                 _html    = (

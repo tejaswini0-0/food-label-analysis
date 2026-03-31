@@ -1,5 +1,57 @@
 [
   {
+    "product": "Example 1",
+    "category": "\ud83c\udff7\ufe0f Other / Unknown",
+    "score": 69,
+    "grade": "C",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 8.0,
+      "calories": 0.0,
+      "total_fat": 8.0,
+      "saturated_fat": 1.0,
+      "sodium": 160.0,
+      "protein": 3.0
+    },
+    "saved_at": "2026-03-31T20:24:07.353052"
+  },
+  {
+    "product": "Example 1",
+    "category": "\ud83c\udff7\ufe0f Other / Unknown",
+    "score": 69,
+    "grade": "C",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 8.0,
+      "calories": 280.0,
+      "total_fat": 8.0,
+      "saturated_fat": 1.0,
+      "sodium": 160.0,
+      "protein": 3.0,
+      "carbohydrates": 37.0
+    },
+    "saved_at": "2026-03-31T20:18:58.095056"
+  },
+  {
+    "product": "Example 1",
+    "category": "\ud83c\udff7\ufe0f Other / Unknown",
+    "score": 69,
+    "grade": "C",
+    "brand": null,
+    "notes": "",
+    "nutrients": {
+      "servings_per_container": 8.0,
+      "calories": 280.0,
+      "total_fat": 8.0,
+      "saturated_fat": 1.0,
+      "sodium": 160.0,
+      "protein": 3.0
+    },
+    "saved_at": "2026-03-31T20:17:57.162467"
+  },
+  {
     "product": "Nutrition Facts",
     "category": "\ud83c\udff7\ufe0f Other / Unknown",
     "score": 82,

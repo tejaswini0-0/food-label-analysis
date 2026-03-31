@@ -26,5 +26,33 @@
       "activity": "Moderately Active",
       "goal": "Balanced"
     }
+  },
+  "abcdef": {
+    "display_name": "ABCDEF",
+    "pw_hash": "7843dfb6302cb5c9aa6d24d5611a5979c0d50ea8f0c4c87e603f0f6b0420373d",
+    "salt": "bee290a9863a780377d6fb6d9ee88b5f",
+    "created": "2026-03-31T20:38:58.028608",
+    "profile": {
+      "weight_kg": 0.0,
+      "height_cm": 0.0,
+      "age": 0,
+      "sex": "Male",
+      "activity": "Moderately Active",
+      "goal": "Balanced"
+    }
+  },
+  "xyzxyz": {
+    "display_name": "XYZXYZ",
+    "pw_hash": "b36adf7f86cbc57e1b74cace6db470ab7e1511d4aa7c1614f213c65518465a64",
+    "salt": "2736057a4200442c29dc371eb2c60f49",
+    "created": "2026-03-31T20:41:40.175350",
+    "profile": {
+      "weight_kg": 55.0,
+      "height_cm": 160.0,
+      "age": 22,
+      "sex": "Female",
+      "activity": "Moderately Active",
+      "goal": "Balanced"
+    }
   }
 }
