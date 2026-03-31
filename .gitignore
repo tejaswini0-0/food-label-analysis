@@ -9,7 +9,7 @@ streamlit/
 # Local data backups (JSON)
 .nutriscan_data/
 
-# Debug scripts
+# Debug scripts (only for local development)
 check_supabase_config.py
 test_groq.py
 
